@@ -1,0 +1,76 @@
+#cloud-config
+# Tailscale Exit Node Configuration
+# ==================================
+# This cloud-init script configures a server as a Tailscale exit node for VPN use.
+#
+# Debugging - View cloud-init logs:
+#   sudo cat /var/log/cloud-init-output.log    # Script output
+#   sudo cat /var/log/cloud-init.log           # Cloud-init process log
+#   sudo cloud-init status --wait              # Wait for completion and show status
+#
+# Prerequisites:
+#   1. Create an OAuth client in Tailscale Admin Console with:
+#      - auth_keys scope (Write)
+#      - Tag: tag:vpn
+#   2. Add autoApprover to your ACL policy:
+#      "autoApprovers": { "exitNode": ["tag:vpn"] }
+
+write_files:
+  # ============================================================================
+  # CONFIGURATION - Set your Tailscale OAuth client secret below
+  # ============================================================================
+  - path: /etc/tailscale/auth.env
+    permissions: '0600'
+    content: |
+      TS_OAUTH_CLIENT_SECRET="tskey-client-xxxxxxxxxxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+  # Sysctl configuration for IP forwarding (required for exit node)
+  - path: /etc/sysctl.d/99-tailscale.conf
+    permissions: '0644'
+    content: |
+      net.ipv4.ip_forward = 1
+      net.ipv6.conf.all.forwarding = 1
+
+  # Tailscale setup script
+  - path: /opt/tailscale-setup.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      # Load auth key from config file
+      source /etc/tailscale/auth.env
+
+      echo "Applying sysctl settings for IP forwarding..."
+      sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+      echo "Installing Tailscale..."
+      curl -fsSL https://tailscale.com/install.sh | sh
+
+      echo "Configuring iptables NAT masquerading..."
+      # Detect primary network interface
+      PRIMARY_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+
+      iptables -t nat -A POSTROUTING -o "$PRIMARY_IFACE" -j MASQUERADE
+      ip6tables -t nat -A POSTROUTING -o "$PRIMARY_IFACE" -j MASQUERADE
+
+      # Persist iptables rules if iptables-persistent is available
+      if command -v netfilter-persistent &> /dev/null; then
+        netfilter-persistent save
+      fi
+
+      echo "Connecting to Tailscale as ephemeral exit node..."
+      tailscale up \
+        --auth-key="${TS_OAUTH_CLIENT_SECRET}?ephemeral=true" \
+        --advertise-exit-node \
+        --advertise-tags=tag:vpn
+
+      echo "Tailscale exit node setup complete!"
+      tailscale status
+
+      # Clean up auth key after use
+      rm -f /etc/tailscale/auth.env
+
+runcmd:
+  - mkdir -p /etc/tailscale
+  - /opt/tailscale-setup.sh
