@@ -19,12 +19,15 @@ hostname: tailscale-vpn
 
 write_files:
   # ============================================================================
-  # CONFIGURATION - Set your Tailscale OAuth client secret below
+  # CONFIGURATION
   # ============================================================================
   - path: /etc/tailscale/auth.env
     permissions: '0600'
     content: |
       TS_OAUTH_CLIENT_SECRET="tskey-client-xxxxxxxxxxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      # Set to your reserved/floating IP to route outbound traffic through it
+      # Leave empty to use the vps's primary IP
+      RESERVED_IP=""
 
   # Sysctl configuration for IP forwarding (required for exit node)
   - path: /etc/sysctl.d/99-tailscale.conf
@@ -49,11 +52,29 @@ write_files:
       echo "Installing Tailscale..."
       curl -fsSL https://tailscale.com/install.sh | sh
 
-      echo "Configuring iptables NAT masquerading..."
-      # Detect primary network interface
+      # Connect to Tailscale BEFORE setting up NAT rules
+      # (so we can reach the Tailscale API using default routing)
+      echo "Connecting to Tailscale as ephemeral exit node..."
+      tailscale up \
+        --auth-key="${TS_OAUTH_CLIENT_SECRET}?ephemeral=true" \
+        --advertise-exit-node \
+        --advertise-tags=tag:vpn
+
+      echo "Tailscale connected!"
+      tailscale status
+
+      # Now configure NAT for VPN traffic
+      echo "Configuring iptables NAT..."
       PRIMARY_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
 
-      iptables -t nat -A POSTROUTING -o "$PRIMARY_IFACE" -j MASQUERADE
+      # Only NAT traffic from Tailscale clients (100.64.0.0/10), not host traffic
+      if [[ -n "${RESERVED_IP:-}" ]]; then
+        echo "Using reserved IP: $RESERVED_IP"
+        iptables -t nat -A POSTROUTING -s 100.64.0.0/10 -o "$PRIMARY_IFACE" -j SNAT --to-source "$RESERVED_IP"
+      else
+        echo "Using primary IP (MASQUERADE)"
+        iptables -t nat -A POSTROUTING -s 100.64.0.0/10 -o "$PRIMARY_IFACE" -j MASQUERADE
+      fi
       ip6tables -t nat -A POSTROUTING -o "$PRIMARY_IFACE" -j MASQUERADE
 
       # Persist iptables rules if iptables-persistent is available
@@ -61,14 +82,7 @@ write_files:
         netfilter-persistent save
       fi
 
-      echo "Connecting to Tailscale as ephemeral exit node..."
-      tailscale up \
-        --auth-key="${TS_OAUTH_CLIENT_SECRET}?ephemeral=true" \
-        --advertise-exit-node \
-        --advertise-tags=tag:vpn
-
       echo "Tailscale exit node setup complete!"
-      tailscale status
 
       # Clean up auth key after use
       rm -f /etc/tailscale/auth.env
